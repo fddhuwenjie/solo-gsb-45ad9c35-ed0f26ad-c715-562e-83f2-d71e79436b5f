@@ -57,6 +57,16 @@
   积分 − 有效扣分，**允许为负**）；排序、Buchholz（随对手的排名
   积分重算）与下一轮积分分组均以排名积分为准。账本只增不改，可按
   参赛者查询完整记录。
+- **冻结式晋级名单**：在所有已生成轮次结束且没有待处理赛果复核时，
+  运营方可按 `request_id` 幂等键、`expected_event_seq` 序号快照、
+  **资格轮次**与**晋级名额**发布一份晋级名单——服务在**同一事务内
+  重算**当时的排名积分与 Buchholz，按排名积分 → Buchholz → 参赛者
+  编号固定裁决，**冻结前 N 名席位与后续候补顺序**；序号变化、名额
+  非法或仍有未完成轮次一律 `409` 且不留记录。名单发布后排名与扣分
+  变化**不改写该版本**；可对**当前有效晋级者**标记放弃，同一事务内
+  把**最前候补**提升为该席位（无候补则保持空席），重复 `request_id`
+  返回首次结果。提供赛事/版本查询，每席位含原始与当前参赛者、状态
+  与冻结依据，发布与递补均写入事件流。
 
 配对在 Edmonds 带花树（Blossom）最小权完美匹配算法上实现
 （`networkx.min_weight_matching`，O(n³)），同代价方案用可加的
@@ -314,7 +324,8 @@ data: {"tournament_id": 1, "seq": 6, "type": "round.generated",
   `round_clock.extended`、`announcement.published`、
   `announcement.acknowledged`、`result_review.created`、
   `result_review.closed`、`penalty.recorded`、`penalty.revoked`、
-  `checkin.snapshot_changed`、`checkin.snapshot_confirmed`；
+  `checkin.snapshot_changed`、`checkin.snapshot_confirmed`、
+  `promotion.published`、`promotion.substituted`；
 - 事件与业务变更在**同一数据库事务**中写入：事务回滚则事件一并
   回滚，不会出现"有事件无变更"或"有变更无事件"；
 - **并发安全**：事件序号不再"查询最大 seq 后插入"，而是对
@@ -954,6 +965,116 @@ curl http://localhost:8000/tournaments/1/participants/3/penalties
 排序、Buchholz 与下一轮积分分组的唯一依据——被扣分者在下一轮会
 按扣分后的排名积分落入对应分组。
 
+### 15. 冻结式晋级名单
+
+赛事**所有已生成轮次均结束且没有待处理赛果复核**时，运营方可发布
+一份**晋级名单**（赛事内版本从 1 递增）。发布请求携带：
+
+- `request_id`：幂等键（赛事内唯一，与放弃操作共用命名空间），重复
+  提交（相同参数）原样返回首次结果；同一 `request_id` 携带不同参数
+  返回 `409`；
+- `expected_event_seq`：发布前断言的赛事当前最大事件序号，用于
+  **乐观快照**——不一致返回 `409` 且不落库；
+- `qualifying_round_no`：**资格轮次**——排名积分与 Buchholz 只统计
+  第 1 轮到该轮（含）的已结束轮次；轮次不存在返回 `409`；
+- `slots`：**晋级名额**——冻结排名前 N 名为晋级席位，其余参赛者按
+  同一次序进入候补。名额小于 1 返回 `422`，超过参赛人数返回 `409`。
+
+发布在**同一事务内**重算当时的排名积分与 Buchholz（含当前有效扣分），
+按**排名积分 → Buchholz → 参赛者编号**固定裁决并冻结：前 N 名写入
+席位（`seats`），其余按序写入候补（`waitlist`）。仍有未完成轮次、
+有待处理复核、资格轮次不存在、名额非法或快照冲突时拒绝且**不留任何
+记录、不占事件序号**。
+
+```bash
+# 先读取当前事件序号
+SEQ=$(curl -s http://localhost:8000/tournaments/1/events | python3 -c \
+  "import sys,json;print(json.load(sys.stdin)['last_seq'])")
+
+# 以第 3 轮为资格轮次发布 2 个晋级名额
+curl -X POST http://localhost:8000/tournaments/1/promotions \
+  -H "Content-Type: application/json" \
+  -d "{\"request_id\": \"promo-1\", \"expected_event_seq\": $SEQ,
+       \"qualifying_round_no\": 3, \"slots\": 2}"
+```
+
+```json
+{
+  "id": 1, "tournament_id": 1, "version": 1,
+  "qualifying_round_no": 3, "slots": 2, "expected_event_seq": 21,
+  "seats": [
+    {"seat_no": 1, "status": "active",
+     "original": {"participant_id": 3, "number": 3, "name": "Cara",
+                  "rank": 1, "rank_points": 2.5, "buchholz": 4.0},
+     "current": {"participant_id": 3, "number": 3, "name": "Cara",
+                 "rank": 1, "rank_points": 2.5, "buchholz": 4.0,
+                 "source": "original"}},
+    {"seat_no": 2, "status": "active",
+     "original": {"participant_id": 1, "number": 1, "name": "Alice",
+                  "rank": 2, "rank_points": 2.0, "buchholz": 4.5},
+     "current": {"participant_id": 1, "number": 1, "name": "Alice",
+                 "rank": 2, "rank_points": 2.0, "buchholz": 4.5,
+                 "source": "original"}}
+  ],
+  "waitlist": [
+    {"position": 1, "status": "waiting",
+     "participant": {"participant_id": 5, "number": 5, "name": "Eve",
+                     "rank": 3, "rank_points": 2.0, "buchholz": 3.5}}
+  ],
+  "created_at": "2026-10-02T08:00:00.000000Z"
+}
+```
+
+每个席位包含**原始参赛者**（发布时冻结）、**当前参赛者**、**状态**
+（`active` / `vacant`）与**冻结依据**（排名、排名积分、Buchholz）；
+`current.source` 标明当前持有者来自原始冻结（`original`）还是候补
+递补（`waitlist`）。发布成功写入 `promotion.published` 事件（载荷含
+名单版本、资格轮次、冻结的席位与候补顺序）。
+
+**发布后冻结**：之后赛果复核更正、扣分登记/撤销、新一轮进行等任何
+排名变化都**不改写已发布版本**——席位与候补的依据在发布时点冻结；
+再次发布只会产生新版本（`version` 递增），旧版本原样保留。
+
+**标记放弃**：`POST /promotion-lists/{list_id}/forfeits`，请求携带
+`request_id`（幂等键）、`participant_id` 与 `reason`。**只有当前
+有效晋级者**（某席位的当前持有者）可被标记放弃——候补、已放弃者或
+不在名单上的参赛者返回 `409`（参赛者不存在 `404`）。放弃在**同一
+事务内**把**最前候补**（顺位最小且仍在候补）提升为该席位的当前持有
+者，并写入 `promotion.substituted` 事件；**无候补可递补时席位保持
+空席**（`status=vacant`，`current=null`）。重复 `request_id` 原样
+返回首次结果，不重复递补。
+
+```bash
+# 选手 3 放弃 -> 最前候补（选手 5）递补席位 1
+curl -X POST http://localhost:8000/promotion-lists/1/forfeits \
+  -H "Content-Type: application/json" \
+  -d '{"request_id": "forfeit-1", "participant_id": 3,
+       "reason": "个人原因退赛"}'
+```
+
+```json
+{
+  "list_id": 1, "tournament_id": 1, "version": 1,
+  "seat_no": 1, "seat_status": "active",
+  "forfeited": {"participant_id": 3, "number": 3, "name": "Cara",
+                "rank": 1, "rank_points": 2.5, "buchholz": 4.0},
+  "promoted": {"participant_id": 5, "number": 5, "name": "Eve",
+               "rank": 3, "rank_points": 2.0, "buchholz": 3.5,
+               "source": "waitlist"},
+  "reason": "个人原因退赛",
+  "created_at": "2026-10-02T09:00:00.000000Z"
+}
+```
+
+**查询**（每席位原始/当前参赛者、状态与冻结依据，候补含顺位与状态）：
+
+```bash
+# 赛事全部版本
+curl http://localhost:8000/tournaments/1/promotions
+# 指定版本
+curl http://localhost:8000/tournaments/1/promotions/1
+```
+
 ## 接口一览
 
 | 方法 | 路径 | 说明 |
@@ -997,6 +1118,10 @@ curl http://localhost:8000/tournaments/1/participants/3/penalties
 | POST | `/penalties/{entry_id}/revoke` | 以新记录撤销一笔仍生效的扣分（幂等 + 序号快照；重复撤销 409） |
 | GET | `/tournaments/{id}/penalties` | 赛事完整扣分账本（按登记顺序） |
 | GET | `/tournaments/{id}/participants/{pid}/penalties` | 参赛者完整账本（逐条记录 + 当前有效扣分合计） |
+| POST | `/tournaments/{id}/promotions` | 发布晋级名单（幂等 + 序号快照；冻结前 N 名席位与候补顺序） |
+| POST | `/promotion-lists/{id}/forfeits` | 标记当前有效晋级者放弃（幂等；最前候补递补，无候补则空席） |
+| GET | `/tournaments/{id}/promotions` | 赛事全部晋级名单版本（席位原始/当前参赛者、状态与依据） |
+| GET | `/tournaments/{id}/promotions/{version}` | 指定版本晋级名单 |
 | PUT | `/matches/{match_id}/result` | 录入/修改一场赛果 |
 | GET | `/tournaments/{id}/standings` | 排名（对局积分、有效扣分、排名积分与 Buchholz 分） |
 | GET | `/tournaments/{id}/events/stream` | SSE 事件流（支持 `Last-Event-ID` 续传、心跳注释） |
@@ -1077,7 +1202,14 @@ request_id 幂等重放与冲突、待处理期间冻结赛果且禁止生成下
 request_id 幂等重放与冲突、撤销同事务置原扣分为已撤销、重复撤销
 与撤销非扣分条目 409、排名积分可为负且排序/Buchholz/下一轮分组
 均以排名积分为准、按参赛者与赛事的完整账本查询、并发撤销同一
-扣分仅一成一败、并发同键不同参数登记仅一成落库），以及
+扣分仅一成一败、并发同键不同参数登记仅一成落库），晋级名单专项
+（轮次未结束/有待处理复核/资格轮次不存在/名额非法/快照冲突 409
+不落库不占号、资格轮次口径只统计该轮之前、固定裁决冻结席位与候补、
+发布后扣分与排名变化不改写已发布版本、request_id 幂等重放与冲突、
+仅当前有效晋级者可放弃且最前候补同事务递补、无候补保持空席、
+递补者再放弃链式递补、名单冻结后赛事继续仍可放弃、发布与递补写入
+事件流、并发放弃同一席位仅一成一败、并发同键不同参数发布仅一成
+落库），以及
 事件流专项测试——事务回滚不留事件、
 提交失败不广播且不留事件、原子计数器回滚不占号、并发报名/赛果/
 开轮（多线程屏障同时放行）下编号与序号唯一连续、并发提交按序号

@@ -11,6 +11,7 @@ from .routers import (
     clock,
     events,
     penalties,
+    promotions,
     result_reviews,
     rounds,
     stations,
@@ -54,9 +55,15 @@ app = FastAPI(
         "可以新记录撤销一笔仍生效的扣分；排名保留对局积分并返回有效扣分"
         "与排名积分（可为负），排序、Buchholz 与下一轮积分分组均以排名"
         "积分为准，账本可按参赛者完整查询。"
+        "支持冻结式晋级名单：在所有已生成轮次结束且无待处理复核时，按"
+        "幂等键、事件序号快照、资格轮次与晋级名额发布名单——同一事务内"
+        "重算排名积分与 Buchholz，按排名积分、Buchholz、参赛者编号固定"
+        "裁决，冻结前 N 名席位与候补顺序；发布后排名与扣分变化不改写该"
+        "版本。可对当前有效晋级者标记放弃，同一事务内以最前候补递补该"
+        "席位（无候补则空席），并提供赛事/版本查询。"
         "另提供每赛事独立序号、可断线续传的 SSE 赛事事件流。"
     ),
-    version="1.7.0",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -74,4 +81,5 @@ app.include_router(clock.router)
 app.include_router(announcements.router)
 app.include_router(result_reviews.router)
 app.include_router(penalties.router)
+app.include_router(promotions.router)
 app.include_router(events.router)

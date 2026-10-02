@@ -757,6 +757,167 @@ class PenaltyEntry(Base):
     participant: Mapped[Participant] = relationship()
 
 
+class PromotionList(Base):
+    """晋级名单版本：发布即冻结，后续排名与扣分变化不改写该版本。
+
+    发布时在同一事务内重算资格轮次（含）之前的排名积分与 Buchholz，
+    按排名积分 → Buchholz → 参赛者编号固定裁决，冻结前 slots 名为
+    晋级席位、其余参赛者按同一次序为候补。席位/候补行保存冻结依据，
+    放弃与递补只更新席位的当前持有者与候补状态。
+    """
+
+    __tablename__ = "promotion_lists"
+    __table_args__ = (
+        UniqueConstraint(
+            "tournament_id", "version", name="uq_promotion_list_version"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tournament_id: Mapped[int] = mapped_column(
+        ForeignKey("tournaments.id", ondelete="CASCADE"), nullable=False
+    )
+    # 赛事内版本：从 1 开始递增
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 资格轮次：排名积分与 Buchholz 只统计第 1..qualifying_round_no 轮
+    qualifying_round_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 晋级名额（席位总数）
+    slots: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 发布前断言的赛事当前最大事件序号（乐观快照，不一致不落库）
+    expected_event_seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+
+    seats: Mapped[list["PromotionSeat"]] = relationship(
+        back_populates="promotion_list",
+        cascade="all, delete-orphan",
+        order_by="PromotionSeat.seat_no",
+    )
+    waitlist_entries: Mapped[list["PromotionWaitlistEntry"]] = relationship(
+        back_populates="promotion_list",
+        cascade="all, delete-orphan",
+        order_by="PromotionWaitlistEntry.position",
+    )
+
+
+class PromotionSeat(Base):
+    """晋级席位：原始持有者与排名依据发布时冻结，当前持有者随放弃/递补变化。"""
+
+    __tablename__ = "promotion_seats"
+    __table_args__ = (
+        UniqueConstraint("list_id", "seat_no", name="uq_promotion_seat_no"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    list_id: Mapped[int] = mapped_column(
+        ForeignKey("promotion_lists.id", ondelete="CASCADE"), nullable=False
+    )
+    # 席位号：1..slots，按发布时冻结排名顺序
+    seat_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 发布时冻结的原始持有者与排名依据（半分单位，发布后不改写）
+    original_participant_id: Mapped[int] = mapped_column(
+        ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    original_rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    original_rank_points: Mapped[int] = mapped_column(Integer, nullable=False)
+    original_buchholz: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 当前持有者：放弃后由最前候补递补；无候补可递补时为 NULL（空席）
+    current_participant_id: Mapped[int | None] = mapped_column(
+        ForeignKey("participants.id", ondelete="CASCADE"), nullable=True
+    )
+    # active（有当前有效晋级者）/ vacant（持有者放弃且无候补，空席）
+    status: Mapped[str] = mapped_column(
+        String(16), default="active", nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+
+    promotion_list: Mapped[PromotionList] = relationship(back_populates="seats")
+
+
+class PromotionWaitlistEntry(Base):
+    """候补顺序条目：发布时冻结排名依据，递补时按 position 升序取最前者。"""
+
+    __tablename__ = "promotion_waitlist_entries"
+    __table_args__ = (
+        UniqueConstraint(
+            "list_id", "position", name="uq_promotion_waitlist_position"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    list_id: Mapped[int] = mapped_column(
+        ForeignKey("promotion_lists.id", ondelete="CASCADE"), nullable=False
+    )
+    # 候补顺位：从 1 开始，按发布时冻结排名顺序
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    participant_id: Mapped[int] = mapped_column(
+        ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    # 发布时冻结的排名依据（半分单位，发布后不改写）
+    rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    rank_points: Mapped[int] = mapped_column(Integer, nullable=False)
+    buchholz: Mapped[int] = mapped_column(Integer, nullable=False)
+    # waiting（候补中）/ promoted（已递补为某席位当前持有者）
+    status: Mapped[str] = mapped_column(
+        String(16), default="waiting", nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+
+    promotion_list: Mapped[PromotionList] = relationship(
+        back_populates="waitlist_entries"
+    )
+
+
+class PromotionAction(Base):
+    """晋级名单发布/放弃请求的幂等记录：同一 request_id 重放原样返回。
+
+    request_id 在赛事内唯一（publish 与 forfeit 共用同一命名空间）；
+    记录与名单版本、席位/候补变更、promotion.* 事件在同一事务中提交。
+    被拒绝的请求（轮次未结束、有待处理复核、名额非法、快照冲突、
+    非当前有效晋级者等，409）不落任何记录。
+    """
+
+    __tablename__ = "promotion_actions"
+    __table_args__ = (
+        UniqueConstraint(
+            "tournament_id", "request_id", name="uq_promotion_action_request"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tournament_id: Mapped[int] = mapped_column(
+        ForeignKey("tournaments.id", ondelete="CASCADE"), nullable=False
+    )
+    list_id: Mapped[int] = mapped_column(
+        ForeignKey("promotion_lists.id", ondelete="CASCADE"), nullable=False
+    )
+    # 客户端幂等键：赛事内唯一
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    # publish（发布名单）/ forfeit（标记放弃并递补）
+    action: Mapped[str] = mapped_column(String(16), nullable=False)
+    # 请求参数指纹：publish 含 qualifying_round_no/slots/
+    # expected_event_seq；forfeit 含 list_id/participant_id/reason
+    params: Mapped[dict] = mapped_column(JSON, nullable=False)
+    # 首次执行后的响应快照：重复 request_id 原样返回
+    response: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+
+    promotion_list: Mapped[PromotionList] = relationship()
+
+
 class ResultReviewAction(Base):
     """复核创建请求的幂等记录：同一 request_id 重放原样返回。
 

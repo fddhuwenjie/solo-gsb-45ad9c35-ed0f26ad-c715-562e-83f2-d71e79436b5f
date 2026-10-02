@@ -37,6 +37,8 @@ PENALTY_RECORDED = "penalty.recorded"
 PENALTY_REVOKED = "penalty.revoked"
 CHECKIN_SNAPSHOT_CHANGED = "checkin.snapshot_changed"
 CHECKIN_SNAPSHOT_CONFIRMED = "checkin.snapshot_confirmed"
+PROMOTION_PUBLISHED = "promotion.published"
+PROMOTION_SUBSTITUTED = "promotion.substituted"
 
 
 def _allocate_next_seq(db: Session, tournament_id: int) -> int:

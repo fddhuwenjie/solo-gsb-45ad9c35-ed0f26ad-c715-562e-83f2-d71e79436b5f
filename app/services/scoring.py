@@ -31,12 +31,15 @@ def compute_records(
     db: Session,
     tournament_id: int,
     include_open: bool = False,
+    through_round_no: int | None = None,
 ) -> list[Record]:
     """计算成绩。
 
-    include_open=False（编排下一轮时使用）：只统计已结束轮次。
+    include_open=False（编排下一轮/发布晋级名单时使用）：只统计已结束轮次。
     include_open=True（排名查询使用）：同时实时计入进行中轮次里
     已经录入的对局与在生成轮次时即确定的轮空。
+    through_round_no 非空时只统计轮次号不超过它的轮次（晋级名单的
+    资格轮次口径）；None 表示统计全部轮次。
     有效扣分（账本中生效的扣分条目）两种口径都计入排名积分。
     """
     # 延迟导入：penalties 服务依赖本模块的 half_to_float
@@ -53,6 +56,8 @@ def compute_records(
         .filter(Round.tournament_id == tournament_id)
         .all()
     )
+    if through_round_no is not None:
+        rounds = [r for r in rounds if r.round_no <= through_round_no]
     if include_open:
         round_ids = {r.id for r in rounds}
     else:
