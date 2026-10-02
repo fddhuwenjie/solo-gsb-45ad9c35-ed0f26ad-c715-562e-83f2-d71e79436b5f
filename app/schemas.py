@@ -692,3 +692,158 @@ class ParticipantPenaltyLedgerResponse(BaseModel):
     effective_penalty: float
     # 全部账本条目（含已撤销的扣分与撤销记录，按登记顺序）
     entries: list[PenaltyEntryResponse]
+
+
+# ---------- Promotion list ----------
+
+class PromotionListPublishRequest(BaseModel):
+    """发布一份晋级名单。"""
+
+    request_id: str = Field(
+        min_length=1, max_length=128, description="幂等键：重复提交返回首次结果"
+    )
+    expected_event_seq: int = Field(
+        ge=0,
+        description="期望的赛事当前最大事件序号；不一致返回 409 且不落库",
+    )
+    qualifying_round_no: int = Field(
+        ge=1, description="资格轮次：排名计算截止的轮次（须为已生成的最后一轮）"
+    )
+    slots: int = Field(
+        ge=1, description="晋级名额 N：前 N 名为晋级席位，其余按排名冻结为候补"
+    )
+
+
+class PromotionForfeitRequest(BaseModel):
+    """对已冻结名单的席位标记放弃。"""
+
+    request_id: str = Field(
+        min_length=1, max_length=128, description="幂等键：重复提交返回首次结果"
+    )
+    participant_id: int = Field(
+        ge=1, description="放弃者（须为该席位当前有效晋级者）"
+    )
+
+
+class PromotionBasis(BaseModel):
+    """冻结的排名依据（发布时快照，后续排名/扣分变化不改写该版本）。"""
+
+    participant_id: int
+    number: int
+    name: str
+    # 发布时名次（排名积分降序 → Buchholz 降序 → 编号升序）
+    rank: int
+    # 对局积分（不含扣分）
+    points: float
+    # 发布时的有效扣分
+    penalty: float
+    # 排名积分 = 对局积分 − 有效扣分
+    rank_points: float
+    # Buchholz：实际对手的排名积分之和
+    buchholz: float
+
+
+class PromotionHolder(BaseModel):
+    """席位当前持有者：冻结依据 + 来源。"""
+
+    participant_id: int
+    number: int
+    name: str
+    rank: int
+    points: float
+    penalty: float
+    rank_points: float
+    buchholz: float
+    # original（发布时的原始晋级者）/ substitute（候补提升）
+    source: str
+    # 仅 source=substitute：候补顺序（从 1 开始）
+    substitute_position: int | None = None
+    # 仅 source=substitute：把该候补提升为本席位的放弃记录 id
+    via_forfeit_id: int | None = None
+
+
+class PromotionForfeitView(BaseModel):
+    """席位上的一次放弃记录（审计用）。"""
+
+    id: int
+    participant_id: int
+    number: int
+    name: str
+    created_at: datetime
+
+    @field_serializer("created_at")
+    def serialize_created_at(self, v: datetime) -> str:
+        return _serialize_utc(v)
+
+
+class PromotionSeatView(BaseModel):
+    """一个晋级席位：原始与当前参赛者、状态与依据。"""
+
+    seat_no: int
+    # active（有当前有效晋级者）/ vacant（放弃且无候补，保持空席）
+    status: str
+    # 发布时冻结的原始晋级者及其排名依据
+    original: PromotionBasis
+    # 当前有效晋级者（空席时为 null）
+    current: PromotionHolder | None
+    # 该席位上的放弃记录（按发生顺序）
+    forfeits: list[PromotionForfeitView]
+
+
+class PromotionSubstituteView(BaseModel):
+    """一名候补：冻结依据与当前状态。"""
+
+    # 候补顺序（从 1 开始，对应发布时名次 slots+1 起）
+    position: int
+    basis: PromotionBasis
+    # waiting（等待提升）/ promoted（已提升且当前在席）/
+    # forfeited（曾提升，后又放弃）
+    status: str
+    # 提升到的席位号（未提升过为 null）
+    promoted_seat_no: int | None = None
+
+
+class PromotionListResponse(BaseModel):
+    id: int
+    tournament_id: int
+    # 赛事内版本（从 1 递增）
+    version: int
+    qualifying_round_no: int
+    slots: int
+    expected_event_seq: int
+    created_at: datetime
+    seats: list[PromotionSeatView]
+    substitutes: list[PromotionSubstituteView]
+
+    @field_serializer("created_at")
+    def serialize_created_at(self, v: datetime) -> str:
+        return _serialize_utc(v)
+
+
+class PromotionParticipantRef(BaseModel):
+    participant_id: int
+    number: int
+    name: str
+
+
+class PromotionForfeitResponse(BaseModel):
+    """席位放弃结果：放弃者、被提升的候补（无候补为空席）。"""
+
+    id: int
+    list_id: int
+    tournament_id: int
+    version: int
+    seat_no: int
+    # 放弃者（操作时的当前有效晋级者）
+    forfeited: PromotionParticipantRef
+    # 被提升的候补（无候补时为 null，席位保持空席）
+    promoted: PromotionParticipantRef | None
+    # 被提升候补的候补顺序（无候补时为 null）
+    promoted_substitute_position: int | None
+    # 放弃后的席位状态：active / vacant
+    seat_status: str
+    created_at: datetime
+
+    @field_serializer("created_at")
+    def serialize_created_at(self, v: datetime) -> str:
+        return _serialize_utc(v)

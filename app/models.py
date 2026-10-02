@@ -788,3 +788,204 @@ class ResultReviewAction(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, nullable=False
     )
+
+
+class PromotionList(Base):
+    """晋级名单：版本化、发布后冻结。
+
+    仅在「所有已生成轮次结束且无待处理赛果复核」时可发布；发布在
+    同一写事务内重新计算当时的排名积分与 Buchholz，按排名积分降序、
+    Buchholz 降序、参赛者编号升序固定裁决，冻结前 N 名（晋级席位）
+    与后续候补顺序。发布后原排名与扣分变化不改写该版本；再次发布
+    生成新版本（version 从 1 递增），旧版本原样保留。
+    """
+
+    __tablename__ = "promotion_lists"
+    __table_args__ = (
+        UniqueConstraint(
+            "tournament_id", "version", name="uq_promotion_list_version"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tournament_id: Mapped[int] = mapped_column(
+        ForeignKey("tournaments.id", ondelete="CASCADE"), nullable=False
+    )
+    # 赛事内版本：从 1 开始递增
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 资格轮次：排名计算截止的轮次（须为发布时已生成的最后一轮）
+    qualifying_round_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 晋级名额 N：前 N 名为晋级席位，其余参赛者按排名冻结为候补
+    slots: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 发布前断言的赛事当前最大事件序号（乐观快照，不一致不落库）
+    expected_event_seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+
+    seats: Mapped[list["PromotionSeat"]] = relationship(
+        back_populates="promotion_list",
+        cascade="all, delete-orphan",
+        order_by="PromotionSeat.seat_no",
+    )
+    substitutes: Mapped[list["PromotionSubstitute"]] = relationship(
+        back_populates="promotion_list",
+        cascade="all, delete-orphan",
+        order_by="PromotionSubstitute.position",
+    )
+    forfeits: Mapped[list["PromotionForfeit"]] = relationship(
+        back_populates="promotion_list",
+        cascade="all, delete-orphan",
+        order_by="PromotionForfeit.id",
+    )
+
+
+class PromotionSeat(Base):
+    """晋级席位：冻结原始晋级者，当前持有者可因放弃/替补而变更。
+
+    original_basis 为发布时冻结的排名依据（名次、对局积分、有效扣分、
+    排名积分、Buchholz），后续排名/扣分变化不改写。当前有效晋级者
+    放弃时在同一事务内把最前候补提升为本席位；无候补时保持空席。
+    """
+
+    __tablename__ = "promotion_seats"
+    __table_args__ = (
+        UniqueConstraint("list_id", "seat_no", name="uq_promotion_seat_no"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    list_id: Mapped[int] = mapped_column(
+        ForeignKey("promotion_lists.id", ondelete="CASCADE"), nullable=False
+    )
+    # 席位号：1..slots，与发布时名次一一对应
+    seat_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 发布时冻结的原始晋级者
+    original_participant_id: Mapped[int] = mapped_column(
+        ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    # 原始晋级者的冻结依据：
+    # {rank, points, penalty, rank_points, buchholz}
+    original_basis: Mapped[dict] = mapped_column(JSON, nullable=False)
+    # 当前有效晋级者；空席时为 NULL
+    current_participant_id: Mapped[int | None] = mapped_column(
+        ForeignKey("participants.id", ondelete="CASCADE"), nullable=True
+    )
+    # active（有当前有效晋级者）/ vacant（放弃且无候补，保持空席）
+    status: Mapped[str] = mapped_column(
+        String(16), default="active", nullable=False
+    )
+
+    promotion_list: Mapped[PromotionList] = relationship(
+        back_populates="seats"
+    )
+
+
+class PromotionSubstitute(Base):
+    """候补：发布时按排名冻结的后续顺序，等待被提升为席位。"""
+
+    __tablename__ = "promotion_substitutes"
+    __table_args__ = (
+        UniqueConstraint(
+            "list_id", "position", name="uq_promotion_substitute_position"
+        ),
+        UniqueConstraint(
+            "list_id",
+            "participant_id",
+            name="uq_promotion_substitute_participant",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    list_id: Mapped[int] = mapped_column(
+        ForeignKey("promotion_lists.id", ondelete="CASCADE"), nullable=False
+    )
+    # 候补顺序：从 1 开始（对应发布时名次 slots+1 起）
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    participant_id: Mapped[int] = mapped_column(
+        ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    # 冻结依据：{rank, points, penalty, rank_points, buchholz}
+    basis: Mapped[dict] = mapped_column(JSON, nullable=False)
+    # waiting（等待提升）/ promoted（已提升且当前在席）/
+    # forfeited（曾提升，后又放弃）
+    status: Mapped[str] = mapped_column(
+        String(16), default="waiting", nullable=False
+    )
+    # 提升到的席位（promoted / forfeited 时有值）
+    promoted_seat_id: Mapped[int | None] = mapped_column(
+        ForeignKey("promotion_seats.id", ondelete="CASCADE"), nullable=True
+    )
+
+    promotion_list: Mapped[PromotionList] = relationship(
+        back_populates="substitutes"
+    )
+
+
+class PromotionForfeit(Base):
+    """席位放弃记录：当前有效晋级者放弃，最前候补同事务提升。
+
+    每次放弃追加一行（只增不改）：放弃者、被提升的候补（无候补为
+    NULL，席位保持空缺）与发生时刻完整保留，供席位依据审计。
+    """
+
+    __tablename__ = "promotion_forfeits"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    list_id: Mapped[int] = mapped_column(
+        ForeignKey("promotion_lists.id", ondelete="CASCADE"), nullable=False
+    )
+    seat_id: Mapped[int] = mapped_column(
+        ForeignKey("promotion_seats.id", ondelete="CASCADE"), nullable=False
+    )
+    # 放弃者（操作时的当前有效晋级者）
+    forfeited_participant_id: Mapped[int] = mapped_column(
+        ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    # 被提升的候补（无候补时为 NULL，席位保持空缺）
+    promoted_substitute_id: Mapped[int | None] = mapped_column(
+        ForeignKey("promotion_substitutes.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+
+    promotion_list: Mapped[PromotionList] = relationship(
+        back_populates="forfeits"
+    )
+
+
+class PromotionAction(Base):
+    """晋级名单发布/放弃请求的幂等记录：同一 request_id 重放原样返回。
+
+    request_id 在赛事内唯一（发布与放弃共用）；记录与名单/席位变更、
+    promotion_list.* 事件在同一事务中提交。资格不符/快照冲突等被
+    拒绝的请求（409）不落任何记录。
+    """
+
+    __tablename__ = "promotion_actions"
+    __table_args__ = (
+        UniqueConstraint(
+            "tournament_id", "request_id", name="uq_promotion_action_request"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tournament_id: Mapped[int] = mapped_column(
+        ForeignKey("tournaments.id", ondelete="CASCADE"), nullable=False
+    )
+    list_id: Mapped[int] = mapped_column(
+        ForeignKey("promotion_lists.id", ondelete="CASCADE"), nullable=False
+    )
+    # 客户端幂等键：赛事内唯一
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    # publish（发布名单）/ forfeit（席位放弃）
+    action: Mapped[str] = mapped_column(String(16), nullable=False)
+    # 请求参数指纹：publish 含 qualifying_round_no/slots/
+    # expected_event_seq；forfeit 含 list_id/seat_no/participant_id
+    params: Mapped[dict] = mapped_column(JSON, nullable=False)
+    # 首次执行后的响应快照：重复 request_id 原样返回
+    response: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )

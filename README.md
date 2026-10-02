@@ -57,6 +57,17 @@
   积分 − 有效扣分，**允许为负**）；排序、Buchholz（随对手的排名
   积分重算）与下一轮积分分组均以排名积分为准。账本只增不改，可按
   参赛者查询完整记录。
+- **版本化晋级名单**：在**所有已生成轮次结束且没有待处理赛果复核**
+  时，运营方可按 `request_id` 幂等键、`expected_event_seq` 序号快照、
+  **资格轮次**（须为已生成的最后一轮）与**晋级名额**发布名单；服务
+  在**同一事务内重新计算当时的排名积分与 Buchholz**，按排名积分 →
+  Buchholz → 参赛者编号固定裁决，**冻结前 N 名席位与后续候补顺序**；
+  事件序号变化、名额非法或仍有未完成轮次一律 `409` 且不留记录。
+  名单发布后原排名与扣分变化**不改写该版本**。对已冻结名单标记
+  **放弃**时，仅该席位**当前有效晋级者**可操作，同一事务内把**最前
+  候补**提升为该席位（无候补时保持空席）；重复 `request_id` 返回
+  首次结果。提供赛事/版本查询（每席位原始与当前参赛者、状态与依据），
+  并写入发布与替补事件。
 
 配对在 Edmonds 带花树（Blossom）最小权完美匹配算法上实现
 （`networkx.min_weight_matching`，O(n³)），同代价方案用可加的
@@ -314,7 +325,8 @@ data: {"tournament_id": 1, "seq": 6, "type": "round.generated",
   `round_clock.extended`、`announcement.published`、
   `announcement.acknowledged`、`result_review.created`、
   `result_review.closed`、`penalty.recorded`、`penalty.revoked`、
-  `checkin.snapshot_changed`、`checkin.snapshot_confirmed`；
+  `checkin.snapshot_changed`、`checkin.snapshot_confirmed`、
+  `promotion_list.published`、`promotion_list.substitute_promoted`；
 - 事件与业务变更在**同一数据库事务**中写入：事务回滚则事件一并
   回滚，不会出现"有事件无变更"或"有变更无事件"；
 - **并发安全**：事件序号不再"查询最大 seq 后插入"，而是对
@@ -954,6 +966,131 @@ curl http://localhost:8000/tournaments/1/participants/3/penalties
 排序、Buchholz 与下一轮积分分组的唯一依据——被扣分者在下一轮会
 按扣分后的排名积分落入对应分组。
 
+### 15. 晋级名单（发布与席位放弃）
+
+赛事**所有已生成轮次均结束且没有待处理赛果复核**时，运营方可发布
+一份**晋级名单**。发布请求携带：
+
+- `request_id`：幂等键（赛事内唯一，发布与放弃共用），重复提交
+  （相同参数）原样返回首次结果；同一 `request_id` 携带不同参数
+  返回 `409`；
+- `expected_event_seq`：发布前断言的赛事当前最大事件序号，用于
+  **乐观快照**——不一致返回 `409` 且不落库；
+- `qualifying_round_no`：**资格轮次**，排名计算截止的轮次，须为
+  已生成的最后一轮，否则 `409`；
+- `slots`：**晋级名额 N**（`>= 1` 且不超过参赛人数，否则 `422`/`409`）。
+
+发布在**同一事务内重新计算当时的排名积分与 Buchholz**，按排名积分
+降序 → Buchholz 降序 → 参赛者编号升序**固定裁决**，冻结前 N 名为
+**晋级席位**、其余参赛者按排名冻结为**候补顺序**。事件序号变化、
+名额非法或仍有未完成轮次一律 `409` 且不留记录、不占事件序号。
+
+```bash
+# 先读取当前事件序号
+SEQ=$(curl -s http://localhost:8000/tournaments/1/events | python3 -c \
+  "import sys,json;print(json.load(sys.stdin)['last_seq'])")
+
+# 第 1 轮结束后发布：2 个晋级名额
+curl -X POST http://localhost:8000/tournaments/1/promotion-lists \
+  -H "Content-Type: application/json" \
+  -d "{\"request_id\": \"promo-1\", \"expected_event_seq\": $SEQ,
+       \"qualifying_round_no\": 1, \"slots\": 2}"
+```
+
+```json
+{
+  "id": 1, "tournament_id": 1, "version": 1,
+  "qualifying_round_no": 1, "slots": 2, "expected_event_seq": 10,
+  "created_at": "2026-10-01T10:00:00.000000Z",
+  "seats": [
+    {"seat_no": 1, "status": "active",
+     "original": {"participant_id": 1, "number": 1, "name": "Alice",
+                  "rank": 1, "points": 1.0, "penalty": 0.0,
+                  "rank_points": 1.0, "buchholz": 0.0},
+     "current": {"participant_id": 1, "number": 1, "name": "Alice",
+                 "rank": 1, "points": 1.0, "penalty": 0.0,
+                 "rank_points": 1.0, "buchholz": 0.0,
+                 "source": "original",
+                 "substitute_position": null, "via_forfeit_id": null},
+     "forfeits": []},
+    {"seat_no": 2, "status": "active",
+     "original": {"participant_id": 5, "number": 5, "name": "Eve",
+                  "rank": 2, "points": 1.0, "penalty": 0.0,
+                  "rank_points": 1.0, "buchholz": 0.0},
+     "current": {"participant_id": 5, "number": 5, "name": "Eve",
+                 "rank": 2, "points": 1.0, "penalty": 0.0,
+                 "rank_points": 1.0, "buchholz": 0.0,
+                 "source": "original",
+                 "substitute_position": null, "via_forfeit_id": null},
+     "forfeits": []}
+  ],
+  "substitutes": [
+    {"position": 1,
+     "basis": {"participant_id": 3, "number": 3, "name": "Cara",
+               "rank": 3, "points": 0.5, "penalty": 0.0,
+               "rank_points": 0.5, "buchholz": 0.5},
+     "status": "waiting", "promoted_seat_no": null},
+    {"position": 2,
+     "basis": {"participant_id": 4, "number": 4, "name": "Dan",
+               "rank": 4, "points": 0.5, "penalty": 0.0,
+               "rank_points": 0.5, "buchholz": 0.5},
+     "status": "waiting", "promoted_seat_no": null},
+    {"position": 3,
+     "basis": {"participant_id": 2, "number": 2, "name": "Bob",
+               "rank": 5, "points": 0.0, "penalty": 0.0,
+               "rank_points": 0.0, "buchholz": 1.0},
+     "status": "waiting", "promoted_seat_no": null}
+  ]
+}
+```
+
+每个席位包含**原始参赛者**（`original`，发布时冻结）、**当前参赛者**
+（`current`）、**状态**（`active` / `vacant`）与**依据**（发布时冻结的
+名次、对局积分、有效扣分、排名积分与 Buchholz）。发布成功写入
+`promotion_list.published` 事件（载荷含名单 id、版本、资格轮次、
+名额与冻结的席位/候补名单）。**名单发布后，原排名与扣分变化不改写
+该版本**；再次发布生成新版本（`version` 递增），旧版本原样保留。
+
+**席位放弃**：对已冻结名单标记放弃，`participant_id` 必须是该席位
+**当前有效晋级者**（原始晋级者或此前被提升的候补），否则 `409`；
+同一事务内把**最前候补**（`position` 最小且仍在等待的候补）提升为
+该席位，写入 `promotion_list.substitute_promoted` 事件；**无候补时
+席位保持空席**（`vacant`），空席不能再放弃。重复 `request_id` 原样
+返回首次结果，不产生新记录与事件。
+
+```bash
+# Alice（席位 1 当前持有者）放弃 -> 最前候补 Cara 提升为席位 1
+curl -X POST http://localhost:8000/promotion-lists/1/seats/1/forfeit \
+  -H "Content-Type: application/json" \
+  -d '{"request_id": "forfeit-1", "participant_id": 1}'
+```
+
+```json
+{
+  "id": 1, "list_id": 1, "tournament_id": 1, "version": 1, "seat_no": 1,
+  "forfeited": {"participant_id": 1, "number": 1, "name": "Alice"},
+  "promoted": {"participant_id": 3, "number": 3, "name": "Cara"},
+  "promoted_substitute_position": 1,
+  "seat_status": "active",
+  "created_at": "2026-10-01T10:05:00.000000Z"
+}
+```
+
+放弃后查询版本详情：席位 1 的 `original` 仍是 Alice（依据不变），
+`current` 变为 Cara（`source=substitute`，`substitute_position=1`，
+`via_forfeit_id` 指向本次放弃记录），`forfeits` 记录放弃历史；候补
+Cara 的 `status` 变为 `promoted`。被提升的候补之后也可放弃（链式
+提升下一位候补）；曾提升又放弃的候补 `status` 为 `forfeited`。
+
+**查询**（每席位原始与当前参赛者、状态和依据，候补顺序与状态）：
+
+```bash
+# 赛事下全部版本
+curl http://localhost:8000/tournaments/1/promotion-lists
+# 指定版本
+curl http://localhost:8000/tournaments/1/promotion-lists/1
+```
+
 ## 接口一览
 
 | 方法 | 路径 | 说明 |
@@ -997,6 +1134,10 @@ curl http://localhost:8000/tournaments/1/participants/3/penalties
 | POST | `/penalties/{entry_id}/revoke` | 以新记录撤销一笔仍生效的扣分（幂等 + 序号快照；重复撤销 409） |
 | GET | `/tournaments/{id}/penalties` | 赛事完整扣分账本（按登记顺序） |
 | GET | `/tournaments/{id}/participants/{pid}/penalties` | 参赛者完整账本（逐条记录 + 当前有效扣分合计） |
+| POST | `/tournaments/{id}/promotion-lists` | 发布晋级名单（冻结前 N 名席位与候补顺序；幂等 + 序号快照；须全部轮次结束且无待处理复核） |
+| POST | `/promotion-lists/{id}/seats/{seat_no}/forfeit` | 席位放弃（仅当前有效晋级者；同事务提升最前候补，无候补保持空席；幂等） |
+| GET | `/tournaments/{id}/promotion-lists` | 赛事下全部晋级名单版本（每席位原始/当前参赛者、状态与依据） |
+| GET | `/tournaments/{id}/promotion-lists/{version}` | 指定版本晋级名单详情 |
 | PUT | `/matches/{match_id}/result` | 录入/修改一场赛果 |
 | GET | `/tournaments/{id}/standings` | 排名（对局积分、有效扣分、排名积分与 Buchholz 分） |
 | GET | `/tournaments/{id}/events/stream` | SSE 事件流（支持 `Last-Event-ID` 续传、心跳注释） |
@@ -1077,7 +1218,14 @@ request_id 幂等重放与冲突、待处理期间冻结赛果且禁止生成下
 request_id 幂等重放与冲突、撤销同事务置原扣分为已撤销、重复撤销
 与撤销非扣分条目 409、排名积分可为负且排序/Buchholz/下一轮分组
 均以排名积分为准、按参赛者与赛事的完整账本查询、并发撤销同一
-扣分仅一成一败、并发同键不同参数登记仅一成落库），以及
+扣分仅一成一败、并发同键不同参数登记仅一成落库），晋级名单专项
+（轮次进行中/有待处理复核/未生成轮次/资格轮次非最后一轮/名额
+非法/快照冲突 409 且不落库不占号、request_id 幂等重放与冲突、
+固定裁决冻结席位与候补顺序及依据、发布后排名与扣分变化不改写
+旧版本、再发布生成新版本、仅当前有效晋级者可放弃、同事务提升
+最前候补与链式提升、无候补保持空席且空席不能再放弃、放弃幂等
+重放、赛事/版本查询、发布与替补事件入流、并发放弃同一席位仅
+一成一败、并发同键不同参数发布仅一成落库），以及
 事件流专项测试——事务回滚不留事件、
 提交失败不广播且不留事件、原子计数器回滚不占号、并发报名/赛果/
 开轮（多线程屏障同时放行）下编号与序号唯一连续、并发提交按序号
